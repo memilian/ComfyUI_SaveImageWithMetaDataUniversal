@@ -17,7 +17,8 @@ was actually applied: an entry counts only when ``enabled`` (or the legacy ``on`
 truthy, ``lora`` names the file, ``strength`` is the model strength, and ``strengthClip``
 (or the legacy ``strengthTwo``) is the CLIP strength, defaulting to the model strength.
 When the optional ``clip`` input is unconnected the node zeroes every CLIP strength, and
-so do these selectors.
+so do these selectors; entries left with both strengths at zero are skipped because the
+node never applies them.
 
 Attributes:
     CAPTURE_FIELD_LIST (dict): Maps ``NdSuperLoraLoader`` to its LoRA capture selectors.
@@ -36,8 +37,6 @@ logger = logging.getLogger(__name__)
 _BUNDLE_FIELD = "lora_bundle"
 _CLIP_FIELD = "clip"
 
-# Cache the parsed+hashed bundle per node id so the two capture passes of a single save
-# (before sampler / before save node) do not re-read and re-hash every LoRA file.
 _NODE_DATA_CACHE: dict[str, tuple[Any, dict[str, list]]] = {}
 
 
@@ -86,18 +85,27 @@ def _unwrap_bundle(value: Any) -> Any:
     return value
 
 
-def _clip_available(batch: Any) -> bool:
+def _clip_connected(obj: Any, batch: Any) -> bool:
     """Report whether the node's optional ``clip`` input is connected.
 
     ``NdSuperLoraLoader.load_loras`` applies ``strength_clip = 0`` when no CLIP is
     supplied, so a model-only workflow must not report CLIP strengths.
 
+    The raw prompt entry is authoritative: a linked input is still listed there when
+    ``get_input_data`` hands back the unresolved ``(None,)`` marker, because
+    ``_sanitize_missing_links`` cannot recover a value from a ``CLIPLoader``. The
+    resolved inputs are only consulted when the raw entry is unavailable.
+
     Args:
+        obj: Raw prompt entry for this node, or None when called directly.
         batch: Resolved node inputs from the capture pipeline (``input_data[0]``).
 
     Returns:
-        bool: True when a CLIP value is present and not an unresolved ``(None,)`` marker.
+        bool: True when a CLIP value is present.
     """
+    raw_inputs = obj.get("inputs") if isinstance(obj, dict) else None
+    if isinstance(raw_inputs, dict):
+        return raw_inputs.get(_CLIP_FIELD) is not None
     if not isinstance(batch, dict):
         return False
     value = batch.get(_CLIP_FIELD)
@@ -106,18 +114,21 @@ def _clip_available(batch: Any) -> bool:
     return value is not None
 
 
-def _enabled_entries(bundle: Any) -> list[tuple[str, float, float]]:
+def _enabled_entries(bundle: Any, clip_connected: bool) -> list[tuple[str, float, float]]:
     """Parse ``lora_bundle`` into ``(name, strength_model, strength_clip)`` tuples.
 
-    Disabled and blank entries are dropped so metadata reflects the LoRAs the node
-    actually loaded. Malformed payloads yield an empty list: capture must never fail
-    an image save because a node wrote something unexpected.
+    Disabled entries are dropped so metadata reflects the LoRAs the node actually
+    loaded, and so are entries with no ``lora`` key or with both strengths at zero.
+    Malformed payloads yield an empty list: capture must never fail an image save
+    because a node wrote something unexpected.
 
     Args:
         bundle: Raw ``lora_bundle`` input (JSON string, list, or widget wrapper).
+        clip_connected: Whether the node's optional ``clip`` input is connected; when it
+            is not, CLIP strengths are zeroed exactly as ``load_loras`` does.
 
     Returns:
-        list[tuple[str, float, float]]: Enabled entries in bundle (load) order.
+        list[tuple[str, float, float]]: Applied entries in bundle (load) order.
     """
     bundle = _unwrap_bundle(bundle)
     if isinstance(bundle, str):
@@ -135,10 +146,9 @@ def _enabled_entries(bundle: Any) -> list[tuple[str, float, float]]:
     for item in bundle:
         if not isinstance(item, dict):
             continue
-        # Same flag lookup as NdSuperLoraLoader.load_loras: no truthy flag means not applied.
         if not bool(item.get("enabled", item.get("on", False))):
             continue
-        name = item.get("lora") or item.get("name") or item.get("model")
+        name = item.get("lora")
         if not isinstance(name, str):
             continue
         name = name.strip()
@@ -152,6 +162,10 @@ def _enabled_entries(bundle: Any) -> list[tuple[str, float, float]]:
             strength_clip = _coerce_float(item.get("strengthTwo"))
         if strength_clip is None:
             strength_clip = strength_model
+        if not clip_connected:
+            strength_clip = 0.0
+        if strength_model == 0 and strength_clip == 0:
+            continue
         entries.append((name, strength_model, strength_clip))
     return entries
 
@@ -204,11 +218,13 @@ def _cache_key(bundle: Any) -> Any:
         return repr(bundle)
 
 
-def _get_lora_data_from_node(node_id: Any, input_data: Any) -> dict[str, list]:
+def _get_lora_data_from_node(node_id: Any, obj: Any, input_data: Any) -> dict[str, list]:
     """Return parsed LoRA data for one node, cached on the bundle and CLIP state.
 
     Args:
         node_id: Unique id of the node in the prompt; used as the cache key.
+        obj: Raw prompt entry for this node, used to tell an absent ``clip`` input from
+            an unresolved link; None when called directly.
         input_data: Capture pipeline tuple whose first element maps resolved inputs.
 
     Returns:
@@ -217,39 +233,74 @@ def _get_lora_data_from_node(node_id: Any, input_data: Any) -> dict[str, list]:
     """
     batch = input_data[0] if input_data and input_data[0] else None
     bundle = batch.get(_BUNDLE_FIELD) if isinstance(batch, dict) else None
-    clip_available = _clip_available(batch)
-    key = (_cache_key(bundle), clip_available)
+    clip_connected = _clip_connected(obj, batch)
+    key = (_cache_key(bundle), clip_connected)
     cache_slot = str(node_id)
     cached = _NODE_DATA_CACHE.get(cache_slot)
     if cached and cached[0] == key:
         return cached[1]
 
-    data = _build_result(_enabled_entries(bundle))
-    if not clip_available:
-        data["clip_strengths"] = [0.0] * len(data["clip_strengths"])
+    data = _build_result(_enabled_entries(bundle, clip_connected))
     _NODE_DATA_CACHE[cache_slot] = (key, data)
     return data
 
 
-# Selectors (note: *args[-1] is the input_data structure from the capture pipeline)
 def get_lora_model_names(node_id: Any, *args: Any) -> list[str]:
-    """Selector returning the enabled LoRA display names for a node."""
-    return _get_lora_data_from_node(node_id, args[-1])["names"]
+    """Selector returning the enabled LoRA display names for a node.
+
+    Args:
+        node_id: Unique id of the node in the prompt.
+        *args: Capture pipeline arguments; ``args[0]`` is the raw prompt entry and
+            ``args[-1]`` the resolved ``input_data`` structure.
+
+    Returns:
+        list[str]: Display names of the applied LoRAs, in bundle order.
+    """
+    return _get_lora_data_from_node(node_id, args[0], args[-1])["names"]
 
 
 def get_lora_model_hashes(node_id: Any, *args: Any) -> list[str | None]:
-    """Selector returning the enabled LoRA hashes for a node."""
-    return _get_lora_data_from_node(node_id, args[-1])["hashes"]
+    """Selector returning the enabled LoRA hashes for a node.
+
+    Args:
+        node_id: Unique id of the node in the prompt.
+        *args: Capture pipeline arguments; ``args[0]`` is the raw prompt entry and
+            ``args[-1]`` the resolved ``input_data`` structure.
+
+    Returns:
+        list[str | None]: Hashes of the applied LoRAs, in bundle order; None when a
+            lookup failed.
+    """
+    return _get_lora_data_from_node(node_id, args[0], args[-1])["hashes"]
 
 
 def get_lora_model_strengths(node_id: Any, *args: Any) -> list[float]:
-    """Selector returning the enabled LoRA model strengths for a node."""
-    return _get_lora_data_from_node(node_id, args[-1])["model_strengths"]
+    """Selector returning the enabled LoRA model strengths for a node.
+
+    Args:
+        node_id: Unique id of the node in the prompt.
+        *args: Capture pipeline arguments; ``args[0]`` is the raw prompt entry and
+            ``args[-1]`` the resolved ``input_data`` structure.
+
+    Returns:
+        list[float]: Model strengths of the applied LoRAs, in bundle order.
+    """
+    return _get_lora_data_from_node(node_id, args[0], args[-1])["model_strengths"]
 
 
 def get_lora_clip_strengths(node_id: Any, *args: Any) -> list[float]:
-    """Selector returning the enabled LoRA CLIP strengths for a node."""
-    return _get_lora_data_from_node(node_id, args[-1])["clip_strengths"]
+    """Selector returning the enabled LoRA CLIP strengths for a node.
+
+    Args:
+        node_id: Unique id of the node in the prompt.
+        *args: Capture pipeline arguments; ``args[0]`` is the raw prompt entry and
+            ``args[-1]`` the resolved ``input_data`` structure.
+
+    Returns:
+        list[float]: CLIP strengths of the applied LoRAs, in bundle order; 0.0 for every
+            entry when the node's ``clip`` input is not connected.
+    """
+    return _get_lora_data_from_node(node_id, args[0], args[-1])["clip_strengths"]
 
 
 CAPTURE_FIELD_LIST = {

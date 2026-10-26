@@ -22,12 +22,12 @@ def _load_module(monkeypatch):
     return mod
 
 
-def _read_all(mod, node_id, input_data):
+def _read_all(mod, node_id, input_data, obj=None):
     return (
-        mod.get_lora_model_names(node_id, None, None, None, None, input_data),
-        mod.get_lora_model_hashes(node_id, None, None, None, None, input_data),
-        mod.get_lora_model_strengths(node_id, None, None, None, None, input_data),
-        mod.get_lora_clip_strengths(node_id, None, None, None, None, input_data),
+        mod.get_lora_model_names(node_id, obj, None, None, None, input_data),
+        mod.get_lora_model_hashes(node_id, obj, None, None, None, input_data),
+        mod.get_lora_model_strengths(node_id, obj, None, None, None, input_data),
+        mod.get_lora_clip_strengths(node_id, obj, None, None, None, input_data),
     )
 
 
@@ -42,7 +42,6 @@ def test_json_bundle_captures_only_enabled_entries(monkeypatch):
     ]
     assert model_strengths == [0.5, 0.6]
     assert clip_strengths == [1.0, 1.0]
-    # Hashes must be computed from the raw bundle name, never the display name.
     assert hashes[0] == "hash::krea/styles/V0idv1_k2.safetensors"
 
 
@@ -98,8 +97,9 @@ def test_singleton_native_bundle_keeps_its_entry(monkeypatch):
 def test_model_only_workflow_records_zero_clip_strength(monkeypatch):
     """Without a CLIP input the node applies CLIP strength 0, so metadata must say 0."""
     mod = _load_module(monkeypatch)
+    obj = {"class_type": "NdSuperLoraLoader", "inputs": {"model": ["85", 0], "lora_bundle": _REAL_BUNDLE}}
     input_data = ({"model": ["85", 0], "lora_bundle": _REAL_BUNDLE},)
-    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "model-only", input_data)
+    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "model-only", input_data, obj)
 
     assert len(names) == 2
     assert model_strengths == [0.5, 0.6]
@@ -114,6 +114,55 @@ def test_cache_refreshes_when_clip_is_connected(monkeypatch):
     assert mod.get_lora_clip_strengths("clip-cache", None, None, None, None, without_clip) == [0.0, 0.0]
     assert mod.get_lora_clip_strengths("clip-cache", None, None, None, None, with_clip) == [1.0, 1.0]
     assert mod.get_lora_clip_strengths("clip-cache", None, None, None, None, without_clip) == [0.0, 0.0]
+
+
+def test_unresolved_clip_link_is_still_treated_as_connected(monkeypatch):
+    """``get_input_data`` reports ``(None,)`` for a CLIP link it cannot resolve; the input is connected."""
+    mod = _load_module(monkeypatch)
+    obj = {"class_type": "NdSuperLoraLoader", "inputs": {"model": ["85", 0], "clip": ["84", 0], "lora_bundle": _REAL_BUNDLE}}
+    input_data = ({"model": ["85", 0], "clip": (None,), "lora_bundle": _REAL_BUNDLE},)
+
+    names, _hashes, _model_strengths, clip_strengths = _read_all(mod, "unresolved-clip", input_data, obj)
+
+    assert len(names) == 2
+    assert clip_strengths == [1.0, 1.0]
+
+
+def test_entries_without_lora_key_are_ignored(monkeypatch):
+    """``load_loras`` reads only the ``lora`` key, so other name fields must not be captured."""
+    mod = _load_module(monkeypatch)
+    bundle = json.dumps(
+        [
+            {"name": "Named.safetensors", "enabled": True, "strength": 0.5, "strengthClip": 1.0},
+            {"model": "Modelled.safetensors", "enabled": True, "strength": 0.5, "strengthClip": 1.0},
+            {"lora": "Real.safetensors", "enabled": True, "strength": 0.5, "strengthClip": 1.0},
+        ]
+    )
+    obj = {"class_type": "NdSuperLoraLoader", "inputs": {"clip": ["84", 0], "lora_bundle": bundle}}
+
+    names, _hashes, _model_strengths, _clip_strengths = _read_all(mod, "names-only", ({"lora_bundle": bundle},), obj)
+
+    assert names == ["display::Real.safetensors"]
+
+
+def test_entries_with_zero_effective_strengths_are_dropped(monkeypatch):
+    """``load_loras`` skips entries whose model and clip strengths are both zero."""
+    mod = _load_module(monkeypatch)
+    bundle = json.dumps(
+        [
+            {"lora": "Kept.safetensors", "enabled": True, "strength": 0.5, "strengthClip": 0.0},
+            {"lora": "Muted.safetensors", "enabled": True, "strength": 0.0, "strengthClip": 0.0},
+        ]
+    )
+    with_clip = {"class_type": "NdSuperLoraLoader", "inputs": {"clip": ["84", 0], "lora_bundle": bundle}}
+
+    names, _hashes, _model_strengths, _clip_strengths = _read_all(mod, "zeros", ({"lora_bundle": bundle},), with_clip)
+    assert names == ["display::Kept.safetensors"]
+
+    clip_only = json.dumps([{"lora": "ClipOnly.safetensors", "enabled": True, "strength": 0.0, "strengthClip": 0.4}])
+    model_only = {"class_type": "NdSuperLoraLoader", "inputs": {"lora_bundle": clip_only}}
+    names, _hashes, _model_strengths, _clip_strengths = _read_all(mod, "clip-only", ({"lora_bundle": clip_only},), model_only)
+    assert names == []
 
 
 def test_entries_without_truthy_flag_are_skipped(monkeypatch):
@@ -202,13 +251,11 @@ def test_capture_pipeline_emits_one_record_per_enabled_lora(monkeypatch):
     loras = cap.Capture.gen_loras(cap.Capture.get_inputs())
 
     assert sorted(key for key in loras if key.endswith("Model name")) == [f"Lora_{i} Model name" for i in range(2)]
-    # Path prefixes are stripped for display, matching every other LoRA loader.
     assert loras["Lora_0 Model name"] == "V0idv1_k2.safetensors"
     assert loras["Lora_0 Strength model"] == 0.5
     assert loras["Lora_0 Strength clip"] == 1.0
     assert loras["Lora_1 Model name"] == "krea2_ta86_inkriot_V2.safetensors"
     assert loras["Lora_1 Strength model"] == 0.6
-    # No raw JSON may leak into any recorded value.
     assert not any("lora_bundle" in str(value) for value in loras.values())
 
 
@@ -247,7 +294,6 @@ def test_stale_user_json_scalar_rule_cannot_replace_the_selector(monkeypatch, tm
             "LORA_MODEL_NAME": {"field_name": "lora_bundle"},
             "LORA_MODEL_HASH": {"field_name": "lora_bundle", "format": "calc_lora_hash"},
         },
-        # Proves this file was actually merged: an entry only the JSON provides.
         "SomeUserOnlyNode": {"MODEL_NAME": {"field_name": "ckpt_name"}},
     }
     (tmp_path / "user_captures.json").write_text(json.dumps(stale_rules), encoding="utf-8")
