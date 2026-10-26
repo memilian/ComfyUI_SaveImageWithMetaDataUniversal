@@ -39,7 +39,14 @@ _NODE_DATA_CACHE: dict[str, tuple[Any, dict[str, list]]] = {}
 
 
 def _coerce_float(value: Any) -> float | None:
-    """Return ``value`` as a float, or None when it is missing or not numeric."""
+    """Coerce a bundle value to ``float``.
+
+    Args:
+        value: Raw JSON value from a bundle entry.
+
+    Returns:
+        float | None: The numeric value, or None when it is missing or not numeric.
+    """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int | float):
@@ -53,7 +60,15 @@ def _coerce_float(value: Any) -> float | None:
 
 
 def _unwrap_bundle(value: Any) -> Any:
-    """Strip widget wrappers (single-element lists, ``{"__value__": ...}``) from a bundle value."""
+    """Strip widget wrappers from a bundle value.
+
+    Args:
+        value: Raw ``lora_bundle`` input, possibly wrapped by the frontend or by an
+            output cache as a single-element list or ``{"__value__": ...}``.
+
+    Returns:
+        Any: The innermost bundle value.
+    """
     while isinstance(value, list | tuple) and len(value) == 1:
         value = value[0]
     if isinstance(value, dict) and "__value__" in value:
@@ -112,10 +127,16 @@ def _enabled_entries(bundle: Any) -> list[tuple[str, float, float]]:
 
 
 def _build_result(entries: list[tuple[str, float, float]]) -> dict[str, list]:
-    """Resolve display names and hashes, keeping all four lists index-aligned.
+    """Resolve display names and hashes for the enabled entries.
 
-    A failed hash lookup is recorded as None for that slot rather than dropped, so
-    names and strengths never shift out of step with their hashes.
+    All four lists stay index-aligned: a failed hash lookup is recorded as None for
+    that slot rather than dropped, so names and strengths never shift out of step.
+
+    Args:
+        entries: ``(name, strength_model, strength_clip)`` tuples in bundle order.
+
+    Returns:
+        dict[str, list]: ``names``, ``hashes``, ``model_strengths`` and ``clip_strengths``.
     """
     result: dict[str, list] = {"names": [], "hashes": [], "model_strengths": [], "clip_strengths": []}
     if not entries:
@@ -137,7 +158,14 @@ def _build_result(entries: list[tuple[str, float, float]]) -> dict[str, list]:
 
 
 def _cache_key(bundle: Any) -> Any:
-    """Return a hashable signature for a bundle value so cache hits require identical input."""
+    """Return a hashable signature for a bundle value.
+
+    Args:
+        bundle: Raw ``lora_bundle`` input.
+
+    Returns:
+        Any: A hashable value that only compares equal for identical bundles.
+    """
     if isinstance(bundle, str):
         return bundle
     try:
