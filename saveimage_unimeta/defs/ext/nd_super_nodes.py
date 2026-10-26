@@ -91,10 +91,9 @@ def _clip_connected(obj: Any, batch: Any) -> bool:
     ``NdSuperLoraLoader.load_loras`` applies ``strength_clip = 0`` when no CLIP is
     supplied, so a model-only workflow must not report CLIP strengths.
 
-    The raw prompt entry is authoritative: a linked input is still listed there when
-    ``get_input_data`` hands back the unresolved ``(None,)`` marker, because
-    ``_sanitize_missing_links`` cannot recover a value from a ``CLIPLoader``. The
-    resolved inputs are only consulted when the raw entry is unavailable.
+    Resolved values take precedence: ``[None]`` is a real absent CLIP, whereas
+    ``(None,)`` is an unresolved-link marker. Fall back to the raw prompt only for
+    that marker or when the resolved input is missing.
 
     Args:
         obj: Raw prompt entry for this node, or None when called directly.
@@ -103,15 +102,15 @@ def _clip_connected(obj: Any, batch: Any) -> bool:
     Returns:
         bool: True when a CLIP value is present.
     """
+    if isinstance(batch, dict) and _CLIP_FIELD in batch:
+        value = batch[_CLIP_FIELD]
+        unresolved = isinstance(value, tuple) and len(value) == 1 and value[0] is None
+        if not unresolved:
+            if isinstance(value, list | tuple):
+                value = value[0] if value else None
+            return value is not None
     raw_inputs = obj.get("inputs") if isinstance(obj, dict) else None
-    if isinstance(raw_inputs, dict):
-        return raw_inputs.get(_CLIP_FIELD) is not None
-    if not isinstance(batch, dict):
-        return False
-    value = batch.get(_CLIP_FIELD)
-    if isinstance(value, list | tuple):
-        value = value[0] if value else None
-    return value is not None
+    return isinstance(raw_inputs, dict) and raw_inputs.get(_CLIP_FIELD) is not None
 
 
 def _enabled_entries(bundle: Any, clip_connected: bool) -> list[tuple[str, float, float]]:
