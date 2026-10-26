@@ -16,6 +16,8 @@ Selection mirrors ``NdSuperLoraLoader.load_loras`` so the captured metadata matc
 was actually applied: an entry counts only when ``enabled`` (or the legacy ``on``) is
 truthy, ``lora`` names the file, ``strength`` is the model strength, and ``strengthClip``
 (or the legacy ``strengthTwo``) is the CLIP strength, defaulting to the model strength.
+When the optional ``clip`` input is unconnected the node zeroes every CLIP strength, and
+so do these selectors.
 
 Attributes:
     CAPTURE_FIELD_LIST (dict): Maps ``NdSuperLoraLoader`` to its LoRA capture selectors.
@@ -32,6 +34,7 @@ from ..meta import MetaField
 logger = logging.getLogger(__name__)
 
 _BUNDLE_FIELD = "lora_bundle"
+_CLIP_FIELD = "clip"
 
 # Cache the parsed+hashed bundle per node id so the two capture passes of a single save
 # (before sampler / before save node) do not re-read and re-hash every LoRA file.
@@ -62,6 +65,10 @@ def _coerce_float(value: Any) -> float | None:
 def _unwrap_bundle(value: Any) -> Any:
     """Strip widget wrappers from a bundle value.
 
+    A one-element list only counts as a wrapper when its item cannot be a bundle entry
+    itself (a JSON string or a ``{"__value__": ...}`` box). A native bundle holding a
+    single entry must stay a list, or ``_enabled_entries`` would discard it.
+
     Args:
         value: Raw ``lora_bundle`` input, possibly wrapped by the frontend or by an
             output cache as a single-element list or ``{"__value__": ...}``.
@@ -70,10 +77,33 @@ def _unwrap_bundle(value: Any) -> Any:
         Any: The innermost bundle value.
     """
     while isinstance(value, list | tuple) and len(value) == 1:
-        value = value[0]
+        item = value[0]
+        if isinstance(item, dict) and "__value__" not in item:
+            break
+        value = item
     if isinstance(value, dict) and "__value__" in value:
         return _unwrap_bundle(value["__value__"])
     return value
+
+
+def _clip_available(batch: Any) -> bool:
+    """Report whether the node's optional ``clip`` input is connected.
+
+    ``NdSuperLoraLoader.load_loras`` applies ``strength_clip = 0`` when no CLIP is
+    supplied, so a model-only workflow must not report CLIP strengths.
+
+    Args:
+        batch: Resolved node inputs from the capture pipeline (``input_data[0]``).
+
+    Returns:
+        bool: True when a CLIP value is present and not an unresolved ``(None,)`` marker.
+    """
+    if not isinstance(batch, dict):
+        return False
+    value = batch.get(_CLIP_FIELD)
+    if isinstance(value, list | tuple):
+        value = value[0] if value else None
+    return value is not None
 
 
 def _enabled_entries(bundle: Any) -> list[tuple[str, float, float]]:
@@ -175,7 +205,7 @@ def _cache_key(bundle: Any) -> Any:
 
 
 def _get_lora_data_from_node(node_id: Any, input_data: Any) -> dict[str, list]:
-    """Return parsed LoRA data for one node, cached on the bundle content.
+    """Return parsed LoRA data for one node, cached on the bundle and CLIP state.
 
     Args:
         node_id: Unique id of the node in the prompt; used as the cache key.
@@ -183,16 +213,20 @@ def _get_lora_data_from_node(node_id: Any, input_data: Any) -> dict[str, list]:
 
     Returns:
         dict[str, list]: ``names``, ``hashes``, ``model_strengths`` and ``clip_strengths``.
+            Clip strengths are zeroed when no CLIP input is connected.
     """
     batch = input_data[0] if input_data and input_data[0] else None
     bundle = batch.get(_BUNDLE_FIELD) if isinstance(batch, dict) else None
-    key = _cache_key(bundle)
+    clip_available = _clip_available(batch)
+    key = (_cache_key(bundle), clip_available)
     cache_slot = str(node_id)
     cached = _NODE_DATA_CACHE.get(cache_slot)
     if cached and cached[0] == key:
         return cached[1]
 
     data = _build_result(_enabled_entries(bundle))
+    if not clip_available:
+        data["clip_strengths"] = [0.0] * len(data["clip_strengths"])
     _NODE_DATA_CACHE[cache_slot] = (key, data)
     return data
 

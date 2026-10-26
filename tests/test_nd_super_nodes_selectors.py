@@ -33,7 +33,8 @@ def _read_all(mod, node_id, input_data):
 
 def test_json_bundle_captures_only_enabled_entries(monkeypatch):
     mod = _load_module(monkeypatch)
-    names, hashes, model_strengths, clip_strengths = _read_all(mod, "1786", ({"lora_bundle": _REAL_BUNDLE},))
+    input_data = ({"lora_bundle": _REAL_BUNDLE, "clip": ["84", 0]},)
+    names, hashes, model_strengths, clip_strengths = _read_all(mod, "1786", input_data)
 
     assert names == [
         "display::krea/styles/V0idv1_k2.safetensors",
@@ -51,7 +52,8 @@ def test_bundle_may_arrive_as_native_list(monkeypatch):
         {"lora": "A.safetensors", "enabled": True, "strength": 0.4, "strengthClip": 0.2},
         {"lora": "B.safetensors", "enabled": True, "strength": 0.9, "strengthClip": 0.1},
     ]
-    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "native", ({"lora_bundle": bundle},))
+    input_data = ({"lora_bundle": bundle, "clip": ["84", 0]},)
+    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "native", input_data)
 
     assert names == ["display::A.safetensors", "display::B.safetensors"]
     assert model_strengths == [0.4, 0.9]
@@ -61,7 +63,8 @@ def test_bundle_may_arrive_as_native_list(monkeypatch):
 def test_legacy_on_flag_and_strength_two_are_honoured(monkeypatch):
     mod = _load_module(monkeypatch)
     bundle = json.dumps([{"lora": "Legacy.safetensors", "on": True, "strength": 0.35, "strengthTwo": 0.15}])
-    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "legacy", ({"lora_bundle": bundle},))
+    input_data = ({"lora_bundle": bundle, "clip": ["84", 0]},)
+    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "legacy", input_data)
 
     assert names == ["display::Legacy.safetensors"]
     assert model_strengths == [0.35]
@@ -71,10 +74,46 @@ def test_legacy_on_flag_and_strength_two_are_honoured(monkeypatch):
 def test_missing_clip_strength_falls_back_to_model_strength(monkeypatch):
     mod = _load_module(monkeypatch)
     bundle = json.dumps([{"lora": "ModelOnly.safetensors", "enabled": True, "strength": 0.55}])
-    _names, _hashes, model_strengths, clip_strengths = _read_all(mod, "clip-fallback", ({"lora_bundle": bundle},))
+    input_data = ({"lora_bundle": bundle, "clip": ["84", 0]},)
+    _names, _hashes, model_strengths, clip_strengths = _read_all(mod, "clip-fallback", input_data)
 
     assert model_strengths == [0.55]
     assert clip_strengths == [0.55]
+
+
+def test_singleton_native_bundle_keeps_its_entry(monkeypatch):
+    """A one-entry native bundle must not be mistaken for a widget wrapper."""
+    mod = _load_module(monkeypatch)
+    entry = {"lora": "Only.safetensors", "enabled": True, "strength": 0.7, "strengthClip": 0.2}
+
+    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "one", ({"lora_bundle": [entry], "clip": ["84", 0]},))
+    assert names == ["display::Only.safetensors"]
+    assert model_strengths == [0.7]
+    assert clip_strengths == [0.2]
+
+    wrapped = _read_all(mod, "one-wrapped", ({"lora_bundle": [[entry]], "clip": ["84", 0]},))
+    assert wrapped[0] == ["display::Only.safetensors"]
+
+
+def test_model_only_workflow_records_zero_clip_strength(monkeypatch):
+    """Without a CLIP input the node applies CLIP strength 0, so metadata must say 0."""
+    mod = _load_module(monkeypatch)
+    input_data = ({"model": ["85", 0], "lora_bundle": _REAL_BUNDLE},)
+    names, _hashes, model_strengths, clip_strengths = _read_all(mod, "model-only", input_data)
+
+    assert len(names) == 2
+    assert model_strengths == [0.5, 0.6]
+    assert clip_strengths == [0.0, 0.0]
+
+
+def test_cache_refreshes_when_clip_is_connected(monkeypatch):
+    mod = _load_module(monkeypatch)
+    without_clip = ({"model": ["85", 0], "lora_bundle": _REAL_BUNDLE},)
+    with_clip = ({"model": ["85", 0], "clip": ["84", 0], "lora_bundle": _REAL_BUNDLE},)
+
+    assert mod.get_lora_clip_strengths("clip-cache", None, None, None, None, without_clip) == [0.0, 0.0]
+    assert mod.get_lora_clip_strengths("clip-cache", None, None, None, None, with_clip) == [1.0, 1.0]
+    assert mod.get_lora_clip_strengths("clip-cache", None, None, None, None, without_clip) == [0.0, 0.0]
 
 
 def test_entries_without_truthy_flag_are_skipped(monkeypatch):
@@ -140,7 +179,10 @@ def _prime_capture(monkeypatch, mod):
 
     class DummyHook:
         current_prompt = {
-            "1786": {"class_type": "NdSuperLoraLoader", "inputs": {"model": ["85", 0], "lora_bundle": _REAL_BUNDLE}},
+            "1786": {
+                "class_type": "NdSuperLoraLoader",
+                "inputs": {"model": ["85", 0], "clip": ["84", 0], "lora_bundle": _REAL_BUNDLE},
+            },
         }
         current_extra_data: dict = {}
         prompt_executer = DummyPromptExecuter()
